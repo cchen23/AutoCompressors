@@ -346,15 +346,38 @@ class LlamaAttention(nn.Module):
                 causal=True,
                 return_attn_probs=output_attentions,
             )
-
+ 
         attn_output = attn_outputs[0] if output_attentions else attn_outputs
         attn_output = attn_output.reshape(*attn_output.shape[:-2], h_size)
         attn_weights = attn_outputs[2] if output_attentions else None
 
         attn_output = self.o_proj(attn_output)
-
         if not output_attentions:
             attn_weights = None
+
+        # Manually compute attn mask because can't get from flash attn when dropout_p == 0
+        k = kv[:, :, 0]
+        v = kv[:, :, 1]
+        testq = q.transpose(1, 2)
+        testk = k.transpose(1, 2)
+        testv = v.transpose(1, 2)
+        testa = testq @ testk.transpose(-2, -1) / self.norm_factor  # bs, h, w
+
+        L, S = testq.size(-2), testk.size(-2)
+        attn_bias = torch.zeros(L, S, dtype=testq.dtype).to(testq.device)
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0).to(testq.device)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(testq.dtype)
+        attn_bias += attention_mask
+
+        testa += attn_bias
+
+        testas = torch.softmax(testa, dim=-1)  # softmax attn weights
+        result = testas @ testv
+        result = result.transpose(1, 2)
+        resultr = result.reshape(result.shape[0], -1, h_size)  # compared to attn_output to make sure comparable
+
+        attn_weights = testas
 
         return attn_output, attn_weights, past_key_value
 
@@ -566,7 +589,6 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
-
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
